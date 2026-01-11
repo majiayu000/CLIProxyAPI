@@ -819,8 +819,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				case 429:
 					var next time.Time
 					backoffLevel := state.Quota.BackoffLevel
+					isRateLimit := false
 					if result.RetryAfter != nil {
-						next = now.Add(*result.RetryAfter)
+						// Distinguish rate limit (short) vs quota exceeded (long)
+						// Rate limit: typically < 60s, just wait briefly
+						// Quota exceeded: typically hours, suspend the account
+						if *result.RetryAfter <= 60*time.Second {
+							isRateLimit = true
+							next = now.Add(*result.RetryAfter)
+						} else {
+							next = now.Add(*result.RetryAfter)
+						}
 					} else {
 						cooldown, nextLevel := nextQuotaCooldown(backoffLevel)
 						if cooldown > 0 {
@@ -829,15 +838,27 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						backoffLevel = nextLevel
 					}
 					state.NextRetryAfter = next
-					state.Quota = QuotaState{
-						Exceeded:      true,
-						Reason:        "quota",
-						NextRecoverAt: next,
-						BackoffLevel:  backoffLevel,
+					if isRateLimit {
+						// Rate limit: don't mark as quota exceeded, just set short cooldown
+						state.Quota = QuotaState{
+							Exceeded:      false,
+							Reason:        "rate_limit",
+							NextRecoverAt: next,
+							BackoffLevel:  0,
+						}
+						// Don't suspend the model for rate limits
+					} else {
+						// Quota exceeded: suspend the account for this model
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "quota",
+							NextRecoverAt: next,
+							BackoffLevel:  backoffLevel,
+						}
+						suspendReason = "quota"
+						shouldSuspendModel = true
+						setModelQuota = true
 					}
-					suspendReason = "quota"
-					shouldSuspendModel = true
-					setModelQuota = true
 				case 408, 500, 502, 503, 504:
 					next := now.Add(1 * time.Minute)
 					state.NextRetryAfter = next
@@ -1074,18 +1095,31 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.StatusMessage = "not_found"
 		auth.NextRetryAfter = now.Add(12 * time.Hour)
 	case 429:
-		auth.StatusMessage = "quota exhausted"
-		auth.Quota.Exceeded = true
-		auth.Quota.Reason = "quota"
 		var next time.Time
+		isRateLimit := false
 		if retryAfter != nil {
-			next = now.Add(*retryAfter)
+			// Distinguish rate limit (short) vs quota exceeded (long)
+			if *retryAfter <= 60*time.Second {
+				isRateLimit = true
+				next = now.Add(*retryAfter)
+			} else {
+				next = now.Add(*retryAfter)
+			}
 		} else {
 			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel)
 			if cooldown > 0 {
 				next = now.Add(cooldown)
 			}
 			auth.Quota.BackoffLevel = nextLevel
+		}
+		if isRateLimit {
+			auth.StatusMessage = "rate limited"
+			auth.Quota.Exceeded = false
+			auth.Quota.Reason = "rate_limit"
+		} else {
+			auth.StatusMessage = "quota exhausted"
+			auth.Quota.Exceeded = true
+			auth.Quota.Reason = "quota"
 		}
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
