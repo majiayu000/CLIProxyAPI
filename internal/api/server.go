@@ -254,6 +254,16 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	// Configure quota fraction threshold
+	auth.SetMinQuotaFraction(cfg.QuotaExceeded.MinFraction)
+	if authManager != nil {
+		// Configure quota check interval (default 300s = 5min if not set)
+		checkInterval := cfg.QuotaExceeded.CheckInterval
+		if checkInterval == 0 && cfg.QuotaExceeded.MinFraction > 0 {
+			checkInterval = 300
+		}
+		authManager.SetQuotaCheckInterval(checkInterval)
+	}
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	if optionState.localPassword != "" {
@@ -912,6 +922,33 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 			log.Debugf("disable_cooling toggled to %t", cfg.DisableCooling)
 		}
 	}
+
+	// Update quota fraction threshold dynamically
+	if oldCfg == nil || oldCfg.QuotaExceeded.MinFraction != cfg.QuotaExceeded.MinFraction {
+		auth.SetMinQuotaFraction(cfg.QuotaExceeded.MinFraction)
+		if oldCfg != nil {
+			log.Debugf("quota min_fraction updated from %.2f to %.2f", oldCfg.QuotaExceeded.MinFraction, cfg.QuotaExceeded.MinFraction)
+		} else {
+			log.Debugf("quota min_fraction set to %.2f", cfg.QuotaExceeded.MinFraction)
+		}
+	}
+
+	// Update quota check interval dynamically
+	if oldCfg == nil || oldCfg.QuotaExceeded.CheckInterval != cfg.QuotaExceeded.CheckInterval {
+		if s.handlers != nil && s.handlers.AuthManager != nil {
+			checkInterval := cfg.QuotaExceeded.CheckInterval
+			if checkInterval == 0 && cfg.QuotaExceeded.MinFraction > 0 {
+				checkInterval = 300
+			}
+			s.handlers.AuthManager.SetQuotaCheckInterval(checkInterval)
+			if oldCfg != nil {
+				log.Debugf("quota check_interval updated from %d to %d", oldCfg.QuotaExceeded.CheckInterval, checkInterval)
+			} else {
+				log.Debugf("quota check_interval set to %d", checkInterval)
+			}
+		}
+	}
+
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second)
 	}

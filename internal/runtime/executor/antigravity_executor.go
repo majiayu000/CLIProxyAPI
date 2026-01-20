@@ -1522,3 +1522,121 @@ func antigravityMinThinkingBudget(model string) int {
 	}
 	return -1
 }
+
+// FetchQuotaResponse represents the response from the fetchAvailableModels API.
+type FetchQuotaResponse struct {
+	Models map[string]struct {
+		DisplayName string `json:"displayName"`
+		QuotaInfo   *struct {
+			RemainingFraction float64 `json:"remainingFraction"`
+			ResetTime         string  `json:"resetTime"`
+		} `json:"quotaInfo"`
+	} `json:"models"`
+}
+
+// FetchQuota queries the Antigravity API to get quota information for all models.
+// Returns a map of model name to QuotaInfo. Implements cliproxyauth.QuotaChecker.
+func (e *AntigravityExecutor) FetchQuota(ctx context.Context, auth *cliproxyauth.Auth) (map[string]cliproxyauth.QuotaInfo, error) {
+	token, _, errToken := e.ensureAccessToken(ctx, auth)
+	if errToken != nil {
+		return nil, errToken
+	}
+
+	baseURL := antigravityBaseURLProd
+	if auth != nil && auth.Metadata != nil {
+		if envVal, ok := auth.Metadata["environment"].(string); ok && envVal == "daily" {
+			baseURL = antigravityBaseURLDaily
+		}
+	}
+
+	reqURL := baseURL + antigravityModelsPath
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create quota request: %w", err)
+	}
+
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("User-Agent", defaultAntigravityAgent)
+
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 30*time.Second)
+	resp, errDo := httpClient.Do(httpReq)
+	if errDo != nil {
+		return nil, fmt.Errorf("quota request failed: %w", errDo)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("quota request returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		return nil, fmt.Errorf("failed to read quota response: %w", errRead)
+	}
+
+	var quotaResp FetchQuotaResponse
+	if errParse := json.Unmarshal(body, &quotaResp); errParse != nil {
+		return nil, fmt.Errorf("failed to parse quota response: %w", errParse)
+	}
+
+	result := make(map[string]cliproxyauth.QuotaInfo, len(quotaResp.Models))
+	for modelName, modelInfo := range quotaResp.Models {
+		if modelInfo.QuotaInfo == nil {
+			continue
+		}
+		qi := cliproxyauth.QuotaInfo{
+			RemainingFraction: modelInfo.QuotaInfo.RemainingFraction,
+		}
+		if modelInfo.QuotaInfo.ResetTime != "" {
+			if t, errTime := time.Parse(time.RFC3339, modelInfo.QuotaInfo.ResetTime); errTime == nil {
+				qi.ResetTime = t
+			}
+		}
+		result[modelName] = qi
+	}
+
+	return result, nil
+}
+
+// UpdateAuthQuota updates the auth's quota state based on fetched quota information.
+// It calculates the minimum remaining fraction across all models and updates the auth.
+// Implements cliproxyauth.QuotaChecker.
+func (e *AntigravityExecutor) UpdateAuthQuota(auth *cliproxyauth.Auth, quotas map[string]cliproxyauth.QuotaInfo) {
+	if auth == nil || len(quotas) == 0 {
+		return
+	}
+
+	now := time.Now()
+	var minFraction float64 = 1.0
+	var earliestReset time.Time
+
+	for model, qi := range quotas {
+		// Update per-model quota state
+		if auth.ModelStates == nil {
+			auth.ModelStates = make(map[string]*cliproxyauth.ModelState)
+		}
+		state, ok := auth.ModelStates[model]
+		if !ok {
+			state = &cliproxyauth.ModelState{Status: cliproxyauth.StatusActive}
+			auth.ModelStates[model] = state
+		}
+		state.Quota.RemainingFraction = qi.RemainingFraction
+		state.Quota.ResetTime = qi.ResetTime
+		state.Quota.LastCheckedAt = now
+
+		// Track minimum across all models
+		if qi.RemainingFraction < minFraction {
+			minFraction = qi.RemainingFraction
+		}
+		if !qi.ResetTime.IsZero() && (earliestReset.IsZero() || qi.ResetTime.Before(earliestReset)) {
+			earliestReset = qi.ResetTime
+		}
+	}
+
+	// Update auth-level quota state with the minimum fraction
+	auth.Quota.RemainingFraction = minFraction
+	auth.Quota.ResetTime = earliestReset
+	auth.Quota.LastCheckedAt = now
+}

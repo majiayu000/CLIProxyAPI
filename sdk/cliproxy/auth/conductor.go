@@ -44,6 +44,21 @@ type RefreshEvaluator interface {
 	ShouldRefresh(now time.Time, auth *Auth) bool
 }
 
+// QuotaChecker allows executors to provide proactive quota checking.
+type QuotaChecker interface {
+	// FetchQuota queries the provider API to get current quota information.
+	// Returns a map of model name to quota info (remaining fraction and reset time).
+	FetchQuota(ctx context.Context, auth *Auth) (map[string]QuotaInfo, error)
+	// UpdateAuthQuota updates the auth's quota state based on fetched quota information.
+	UpdateAuthQuota(auth *Auth, quotas map[string]QuotaInfo)
+}
+
+// QuotaInfo represents quota information for a single model.
+type QuotaInfo struct {
+	RemainingFraction float64
+	ResetTime         time.Time
+}
+
 const (
 	refreshCheckInterval  = 5 * time.Second
 	refreshPendingBackoff = time.Minute
@@ -125,6 +140,11 @@ type Manager struct {
 
 	// Auto refresh state
 	refreshCancel context.CancelFunc
+
+	// Quota check interval in seconds. 0 disables quota checking.
+	quotaCheckInterval atomic.Int64
+	// lastQuotaCheck tracks the last quota check time per auth ID.
+	lastQuotaCheck sync.Map
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -184,6 +204,18 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration) {
 	}
 	m.requestRetry.Store(int32(retry))
 	m.maxRetryInterval.Store(maxRetryInterval.Nanoseconds())
+}
+
+// SetQuotaCheckInterval sets the interval between quota checks in seconds.
+// Set to 0 to disable periodic quota checking.
+func (m *Manager) SetQuotaCheckInterval(seconds int) {
+	if m == nil {
+		return
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	m.quotaCheckInterval.Store(int64(seconds))
 }
 
 // RegisterExecutor registers a provider executor with the manager.
@@ -763,6 +795,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	shouldResumeModel := false
 	shouldSuspendModel := false
 	suspendReason := ""
+	var suspendExpireAt time.Time
 	clearModelQuota := false
 	setModelQuota := false
 
@@ -805,16 +838,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					next := now.Add(30 * time.Minute)
 					state.NextRetryAfter = next
 					suspendReason = "unauthorized"
+					suspendExpireAt = next
 					shouldSuspendModel = true
 				case 402, 403:
 					next := now.Add(30 * time.Minute)
 					state.NextRetryAfter = next
 					suspendReason = "payment_required"
+					suspendExpireAt = next
 					shouldSuspendModel = true
 				case 404:
 					next := now.Add(12 * time.Hour)
 					state.NextRetryAfter = next
 					suspendReason = "not_found"
+					suspendExpireAt = next
 					shouldSuspendModel = true
 				case 429:
 					var next time.Time
@@ -856,6 +892,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							BackoffLevel:  backoffLevel,
 						}
 						suspendReason = "quota"
+						suspendExpireAt = next
 						shouldSuspendModel = true
 						setModelQuota = true
 					}
@@ -887,7 +924,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if shouldResumeModel {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
 	} else if shouldSuspendModel {
-		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason, suspendExpireAt)
 	}
 
 	m.hook.OnResult(ctx, result)
@@ -1300,7 +1337,83 @@ func (m *Manager) checkRefreshes(ctx context.Context) {
 			}
 			go m.refreshAuth(ctx, a.ID)
 		}
+
+		// Check quota for providers that support it
+		if m.shouldCheckQuota(a, now) {
+			go m.checkQuota(ctx, a.ID)
+		}
 	}
+}
+
+// shouldCheckQuota determines if we should check quota for this auth.
+func (m *Manager) shouldCheckQuota(auth *Auth, now time.Time) bool {
+	if auth == nil || auth.Disabled {
+		return false
+	}
+	interval := m.quotaCheckInterval.Load()
+	if interval <= 0 {
+		return false
+	}
+	// Check if the executor supports quota checking
+	exec := m.executorFor(auth.Provider)
+	if exec == nil {
+		return false
+	}
+	if _, ok := exec.(QuotaChecker); !ok {
+		return false
+	}
+	// Check last quota check time
+	lastCheck, ok := m.lastQuotaCheck.Load(auth.ID)
+	if ok {
+		if lastTime, isTime := lastCheck.(time.Time); isTime {
+			if now.Sub(lastTime) < time.Duration(interval)*time.Second {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// checkQuota fetches and updates quota information for an auth.
+func (m *Manager) checkQuota(ctx context.Context, authID string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.RLock()
+	auth := m.auths[authID]
+	var exec ProviderExecutor
+	if auth != nil {
+		exec = m.executors[auth.Provider]
+	}
+	m.mu.RUnlock()
+
+	if auth == nil || exec == nil {
+		return
+	}
+
+	checker, ok := exec.(QuotaChecker)
+	if !ok {
+		return
+	}
+
+	// Mark as checking
+	m.lastQuotaCheck.Store(authID, time.Now())
+
+	cloned := auth.Clone()
+	quotas, err := checker.FetchQuota(ctx, cloned)
+	if err != nil {
+		log.Debugf("quota check failed for %s (%s): %v", auth.Provider, authID, err)
+		return
+	}
+
+	// Update auth quota state
+	checker.UpdateAuthQuota(cloned, quotas)
+	cloned.UpdatedAt = time.Now()
+
+	// Persist the updated auth
+	_, _ = m.Update(ctx, cloned)
+	log.Debugf("quota updated for %s (%s): min remaining %.2f%%",
+		auth.Provider, authID, cloned.Quota.RemainingFraction*100)
 }
 
 func (m *Manager) snapshotAuths() []*Auth {

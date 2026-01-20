@@ -136,6 +136,16 @@ type QuotaExceeded struct {
 
 	// SwitchPreviewModel indicates whether to automatically switch to a preview model when a quota is exceeded.
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
+
+	// MinFraction is the minimum remaining quota fraction (0.0-1.0) before blocking an account.
+	// For example, 0.05 means accounts with less than 5% remaining quota will be skipped.
+	// Only applies to providers that support proactive quota checking (e.g., antigravity).
+	// Default is 0 (disabled).
+	MinFraction float64 `yaml:"min-fraction" json:"min-fraction"`
+
+	// CheckInterval is the interval between quota checks in seconds.
+	// Default is 300 (5 minutes). Set to 0 to disable periodic quota checking.
+	CheckInterval int `yaml:"check-interval" json:"check-interval"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -32,7 +33,36 @@ const (
 	blockReasonCooldown
 	blockReasonDisabled
 	blockReasonOther
+	blockReasonQuotaLow
 )
+
+// minQuotaFraction holds the global minimum quota fraction threshold.
+// Accounts with RemainingFraction below this value will be blocked.
+var minQuotaFraction atomic.Value
+
+func init() {
+	minQuotaFraction.Store(float64(0))
+}
+
+// SetMinQuotaFraction updates the minimum quota fraction threshold.
+// Value should be between 0.0 and 1.0 (e.g., 0.05 for 5%).
+func SetMinQuotaFraction(fraction float64) {
+	if fraction < 0 {
+		fraction = 0
+	}
+	if fraction > 1 {
+		fraction = 1
+	}
+	minQuotaFraction.Store(fraction)
+}
+
+// GetMinQuotaFraction returns the current minimum quota fraction threshold.
+func GetMinQuotaFraction() float64 {
+	if v := minQuotaFraction.Load(); v != nil {
+		return v.(float64)
+	}
+	return 0
+}
 
 type modelCooldownError struct {
 	model    string
@@ -112,7 +142,8 @@ func collectAvailable(auths []*Auth, model string, now time.Time) (available []*
 			available = append(available, candidate)
 			continue
 		}
-		if reason == blockReasonCooldown {
+		// Count both cooldown and quota-low as recoverable blocks
+		if reason == blockReasonCooldown || reason == blockReasonQuotaLow {
 			cooldownCount++
 			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 				earliest = next
@@ -190,11 +221,31 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+
+	// Check minimum quota fraction threshold at auth level
+	minFraction := GetMinQuotaFraction()
+	if minFraction > 0 && auth.Quota.RemainingFraction > 0 && auth.Quota.RemainingFraction < minFraction {
+		// Account quota is below threshold, block until reset time
+		resetTime := auth.Quota.ResetTime
+		if resetTime.IsZero() {
+			resetTime = auth.Quota.NextRecoverAt
+		}
+		return true, blockReasonQuotaLow, resetTime
+	}
+
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			if state, ok := auth.ModelStates[model]; ok && state != nil {
 				if state.Status == StatusDisabled {
 					return true, blockReasonDisabled, time.Time{}
+				}
+				// Check minimum quota fraction for per-model state
+				if minFraction > 0 && state.Quota.RemainingFraction > 0 && state.Quota.RemainingFraction < minFraction {
+					resetTime := state.Quota.ResetTime
+					if resetTime.IsZero() {
+						resetTime = state.Quota.NextRecoverAt
+					}
+					return true, blockReasonQuotaLow, resetTime
 				}
 				if state.Unavailable {
 					if state.NextRetryAfter.IsZero() {

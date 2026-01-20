@@ -75,6 +75,13 @@ type QuotaState struct {
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+	// RemainingFraction stores the remaining quota percentage (0.0-1.0).
+	// A value of 1.0 means 100% remaining, 0.05 means 5% remaining.
+	RemainingFraction float64 `json:"remaining_fraction,omitempty"`
+	// ResetTime is when the quota will reset (from provider API).
+	ResetTime time.Time `json:"reset_time,omitempty"`
+	// LastCheckedAt records when the quota was last queried from the provider.
+	LastCheckedAt time.Time `json:"last_checked_at,omitempty"`
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.
