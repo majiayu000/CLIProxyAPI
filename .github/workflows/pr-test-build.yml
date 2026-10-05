@@ -17,6 +17,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Test quota protection
+        run: go test -race ./sdk/cliproxy/auth ./internal/api
       - name: Build
         run: |
           go build -o test-output ./cmd/server

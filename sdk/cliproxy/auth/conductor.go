@@ -218,6 +218,14 @@ func (m *Manager) SetQuotaCheckInterval(seconds int) {
 	m.quotaCheckInterval.Store(int64(seconds))
 }
 
+// QuotaCheckInterval returns the configured quota polling interval in seconds.
+func (m *Manager) QuotaCheckInterval() int {
+	if m == nil {
+		return 0
+	}
+	return int(m.quotaCheckInterval.Load())
+}
+
 // RegisterExecutor registers a provider executor with the manager.
 func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	if executor == nil {
@@ -795,7 +803,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	shouldResumeModel := false
 	shouldSuspendModel := false
 	suspendReason := ""
-	var suspendExpireAt time.Time
 	clearModelQuota := false
 	setModelQuota := false
 
@@ -838,19 +845,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					next := now.Add(30 * time.Minute)
 					state.NextRetryAfter = next
 					suspendReason = "unauthorized"
-					suspendExpireAt = next
 					shouldSuspendModel = true
 				case 402, 403:
 					next := now.Add(30 * time.Minute)
 					state.NextRetryAfter = next
 					suspendReason = "payment_required"
-					suspendExpireAt = next
 					shouldSuspendModel = true
 				case 404:
 					next := now.Add(12 * time.Hour)
 					state.NextRetryAfter = next
 					suspendReason = "not_found"
-					suspendExpireAt = next
 					shouldSuspendModel = true
 				case 429:
 					var next time.Time
@@ -892,7 +896,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							BackoffLevel:  backoffLevel,
 						}
 						suspendReason = "quota"
-						suspendExpireAt = next
 						shouldSuspendModel = true
 						setModelQuota = true
 					}
@@ -924,7 +927,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if shouldResumeModel {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
 	} else if shouldSuspendModel {
-		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason, suspendExpireAt)
+		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 	}
 
 	m.hook.OnResult(ctx, result)
