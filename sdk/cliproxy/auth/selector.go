@@ -224,7 +224,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 
 	// Check minimum quota fraction threshold at auth level
 	minFraction := GetMinQuotaFraction()
-	if minFraction > 0 && auth.Quota.RemainingFraction > 0 && auth.Quota.RemainingFraction < minFraction {
+	if minFraction > 0 && !auth.Quota.LastCheckedAt.IsZero() && auth.Quota.RemainingFraction < minFraction {
 		// Account quota is below threshold, block until reset time
 		resetTime := auth.Quota.ResetTime
 		if resetTime.IsZero() {
@@ -240,7 +240,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 					return true, blockReasonDisabled, time.Time{}
 				}
 				// Check minimum quota fraction for per-model state
-				if minFraction > 0 && state.Quota.RemainingFraction > 0 && state.Quota.RemainingFraction < minFraction {
+				if minFraction > 0 && !state.Quota.LastCheckedAt.IsZero() && state.Quota.RemainingFraction < minFraction {
 					resetTime := state.Quota.ResetTime
 					if resetTime.IsZero() {
 						resetTime = state.Quota.NextRecoverAt

@@ -934,7 +934,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	}
 
 	// Update quota check interval dynamically
-	if oldCfg == nil || oldCfg.QuotaExceeded.CheckInterval != cfg.QuotaExceeded.CheckInterval {
+	if oldCfg == nil || oldCfg.QuotaExceeded.CheckInterval != cfg.QuotaExceeded.CheckInterval || oldCfg.QuotaExceeded.MinFraction != cfg.QuotaExceeded.MinFraction {
 		if s.handlers != nil && s.handlers.AuthManager != nil {
 			checkInterval := cfg.QuotaExceeded.CheckInterval
 			if checkInterval == 0 && cfg.QuotaExceeded.MinFraction > 0 {
